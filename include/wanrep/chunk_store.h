@@ -50,16 +50,6 @@ struct ChunkLoc {
   uint32_t length = 0;
 };
 
-// SHA-256 output is uniformly distributed, so the first 8 bytes are already an excellent
-// hash. Re-hashing them would cost time and add nothing.
-struct DigestHash {
-  size_t operator()(const Digest32& d) const noexcept {
-    uint64_t v;
-    std::memcpy(&v, d.data(), sizeof(v));
-    return static_cast<size_t>(v);
-  }
-};
-
 class ChunkStore {
  public:
   // 128 MiB per container: large enough that a big store is not thousands of open files,

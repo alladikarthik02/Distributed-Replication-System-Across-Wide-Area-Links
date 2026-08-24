@@ -18,6 +18,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
 #include <string>
 #include <string_view>
@@ -31,6 +32,17 @@ namespace wanrep {
 // A SHA-256 digest: the name of a chunk. Content addressing means this value *is*
 // the identity of the bytes -- see SPEC 3.0.
 using Digest32 = std::array<uint8_t, 32>;
+
+// A hash functor for using a Digest32 as a map key. SHA-256 output is uniformly
+// distributed, so the first 8 bytes are already an excellent hash -- re-hashing them
+// would cost time and add nothing.
+struct DigestHash {
+  size_t operator()(const Digest32& d) const noexcept {
+    uint64_t v;
+    std::memcpy(&v, d.data(), sizeof(v));
+    return static_cast<size_t>(v);
+  }
+};
 
 using ByteSpan = std::span<const uint8_t>;
 
