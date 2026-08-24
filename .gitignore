@@ -1,0 +1,7 @@
+build/
+build-*/
+*.o
+*.a
+.DS_Store
+scratch/out/
+bench/data/
