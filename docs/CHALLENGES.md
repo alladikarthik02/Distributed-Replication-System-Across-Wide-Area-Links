@@ -224,7 +224,117 @@ returning 100%.
 
 ---
 
-## Open questions carried into T2+
+## B4 🐛💾 Recovery deleted good data: one flipped byte destroyed a whole container
+
+**The most serious defect found so far, and it was found by disbelieving a passing test.**
+
+**Symptom.** A T6 test corrupted one byte inside a stored chunk and asserted the store
+would notice. It failed in a confusing way -- not "corruption undetected" but:
+
+```
+CHECK(got.code() == Err::kCorrupt)     -- got kNotFound
+CHECK_GT(v->problems, 0)               -- got 0
+```
+
+The chunk was not corrupt. The chunk was *gone*, and `verify()` called the store clean.
+
+**Hypotheses.**
+- (H1) The test's `dd` did not actually write where I thought, so nothing was corrupted.
+  — *Rejected:* if nothing had changed, `get()` would have succeeded, not returned
+  `kNotFound`. Something definitely happened to that chunk.
+- (H2) The CRC check on read is not running, so `get()` missed the corruption and the
+  `kNotFound` is unrelated. — *Rejected:* `kNotFound` comes from the index lookup, which
+  is *before* any read. The chunk was missing from the index, not misread.
+- (H3) Recovery removed it. — Correct, and far worse than it first looked.
+
+**How I isolated it.** Wrote a 20-line probe that stored five chunks, corrupted one byte
+inside the payload of the **first** one, reopened, and printed which chunks survived:
+
+```
+before: chunks=5
+after corrupting record 0 of 5: chunks=0
+  chunk 0 present: 0    chunk 1 present: 0    chunk 2 present: 0
+  chunk 3 present: 0    chunk 4 present: 0
+```
+
+**All five.** One flipped byte in the first record destroyed the entire container, and
+`verify()` reported no problems -- because there was nothing left to be wrong.
+
+**Root cause.** `recover()` scanned records sequentially and, at the first record that
+failed to parse, treated it as a **torn tail** and truncated the file there. Two entirely
+different failures are indistinguishable to a sequential scanner:
+
+| | what it is | correct response |
+|---|---|---|
+| **Torn tail** | crash partway through an append; nothing valid after it | truncate |
+| **Mid-file damage** | bit rot, bad sector, stray write; valid records still follow | keep them, report the damage |
+
+The code implemented the first response for both cases. The irony is that the fix was
+already described in the codebase: `types.h` documents the per-record magic as
+"a resynchronization point in a damaged file". That was a comment, not a mechanism.
+
+**Fix.** On a record that does not parse, **resynchronize instead of guessing**: scan
+forward for the next offset holding a record that fully validates (magic + in-range
+length + payload present + CRC over that payload). Finding one *proves* this was not a
+tail, so the damaged span is skipped and recorded rather than truncated away; finding
+none means it really was a tail, and truncation is correct. A false resync would require
+a 32-bit CRC collision on top of a 4-byte magic match. The scan is buffered in 1 MiB
+windows with a 3-byte overlap so a magic straddling a window boundary is still found --
+one `pread` per byte would be 128 million syscalls on a full container.
+
+Two supporting changes, because the fix alone would still have been quiet:
+- `ChunkStore::damage()` reports every skipped region (container, offset, length).
+- `verify()` counts recovery damage as a problem. Without that, a store that had *lost
+  records* still reported clean, which is how this bug hid in the first place.
+
+After the fix, the same probe:
+
+```
+after corrupting record 0 of 5: chunks=4
+  DAMAGE: container=0 off=0 len=4048
+verify problems=1
+```
+
+**Generalizes to.** Three things:
+
+- **A recovery path is code, and it is the least-tested code you own.** It runs only after
+  something already went wrong, so its bugs are discovered at the worst possible moment.
+  It deserves more adversarial testing than the happy path, not less.
+- **When two different failures produce the same observation, you cannot pick a response
+  by guessing -- you have to go get more evidence.** Here the evidence was one forward
+  scan away, and the cost of not looking was silent data loss.
+- **"Clean" from a verifier is only meaningful if the verifier can see what was lost.**
+  A checker that inspects only what survived will always say the store is fine. That is
+  not a bug in the store; it is a bug in the definition of the check.
+
+---
+
+## B5 🧱 The portability layer was written with a GNU extension
+
+**Symptom.** `io.h` compiled but produced ten copies of:
+
+```
+warning: ISO C++ forbids braced-groups within expressions [-Wpedantic]
+```
+
+**Root cause.** The EINTR-retry helper was a macro using a statement expression,
+`({ ... })` -- a GNU extension. `CMakeLists.txt` sets `CMAKE_CXX_EXTENSIONS OFF` with
+the comment *"-std=c++20, never -std=gnu++20: portability is a claim we make"*. The file
+whose whole job is to wrap platform quirks was itself written in a compiler-specific
+dialect.
+
+**Fix.** A function template instead: `eintr_retry([&] { return ::read(...); })`. Same
+semantics, no extension, and it type-checks the retried expression rather than
+textually pasting it.
+
+**Generalizes to.** A warning that fires ten times is usually one decision, not ten
+mistakes -- fix the decision. And when a project states a rule in a build file, the code
+that is most likely to violate it is the code closest to the platform, which is exactly
+where the rule matters most.
+
+---
+
+## Open questions carried forward
 
 - `WanLink`'s emulated RTT sits on top of a **2.6–10.2 µs** loopback baseline with p99
   excursions to 54 µs (§2.5). That is fine at 10 ms and above; it means a sub-millisecond
