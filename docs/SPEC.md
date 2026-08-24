@@ -428,11 +428,16 @@ stage behind it.
 - **One sender thread owns the socket.** This removes the need for any lock around `write()` and
   guarantees frames are never interleaved. It costs nothing: a single thread saturates a WAN link
   by a wide margin, since the expensive work (hashing, compressing) already happened upstream.
-- **Chunking and hashing are the CPU bottleneck**, which is why they fan out to N workers.
-  Project #1 measured SHA-256 at 2074 MB/s with the ARMv8 SHA-2 backend and 124 MB/s without — the
-  same runtime-dispatched implementation is carried over here, and on a WAN link even the scalar
-  path outruns the wire. It is fanned out anyway because LAN-speed and loopback benchmarks are where
-  the pipeline's shape is actually visible.
+- **Chunking and hashing are the CPU bottleneck of the source**, which is why they fan out to N
+  workers — but T1 measured how much headroom there actually is, and the honest answer changes the
+  emphasis. Chunking alone runs at **1 855 MB/s**; chunking *plus* SHA-256 fingerprinting, which is
+  the real per-byte cost, runs at **966 MB/s** on one thread. A 100 Mbit/s WAN link is 12.5 MB/s, so
+  a single thread covers it **77×** over, and even a 1 Gbit/s link needs 13% of one core.
+  **Therefore:** the fan-out is not what makes the WAN case work — one thread already does. It earns
+  its place for LAN- and loopback-speed runs, where the pipeline's shape is actually visible, and for
+  the compressor stage, which is the slower one. This is written down here rather than left implied,
+  because "we parallelised the hot path" is only worth saying next to the number that shows what the
+  hot path could already do. See §8.5.
 
 **The queues (R2.1).**
 
@@ -695,7 +700,10 @@ free and rsync's per-file model does not. Naming the trade rather than claiming 
 An uncontended `std::mutex` on Linux is a couple of atomic operations and never enters the kernel.
 With 4–8 producers and items that each represent kilobytes of hashing and compression work, queue
 contention may simply not be the bottleneck, and the lock-free queues may measure *the same* as the
-mutex baseline. If that is what `bench/queues` says, it goes in `BENCHMARKS.md` as the result, the
+mutex baseline. T1's measurement makes this more likely, not less: at 966 MB/s of chunk+hash per
+thread, a queue item represents ~8.5 µs of upstream work, which is thousands of times the cost of a
+mutex acquisition. The queues will be measured against that baseline in T4 with the expectation
+that the honest answer may be "no faster, and kept for the bounded-latency property." If that is what `bench/queues` says, it goes in `BENCHMARKS.md` as the result, the
 queues stay (for the bounded-latency and no-blocking-under-backpressure properties, which are real
 and separately measurable), and the headline claim is reworded from a performance claim to a design
 claim. The measurement decides the wording; the wording does not decide the measurement.
@@ -746,10 +754,19 @@ The general lesson, recorded because it is the kind of thing that is obvious onl
 afterwards: a POSIX call succeeding is not evidence that it did anything. `flock`
 returned 0 both times.
 
-### 8.9 Chunk-size distribution is an assumption until measured
+### 8.9 Chunk-size distribution is a property of the content, and T1 measured how much
 
 Every per-chunk overhead figure above (36 B manifest entry, 48 B record header, ~0.44%) assumes the
-chunker actually produces ~8 KiB average chunks. Rolling-hash chunkers routinely miss their target
-on real data — long zero runs, highly structured binaries. T1 therefore **reports the measured
-distribution** (mean, p1, p50, p99, max, fraction hitting `MaxSize`) before any of those numbers are
-quoted as real.
+chunker actually produces ~8 KiB average chunks. **On random data it does** — T1 measured mean
+9 316 B, p1 2 303, p50 9 198, p99 17 048, max 26 436, with 0.000% of chunks hitting the 64 KiB
+ceiling.
+
+**On constant-byte runs it does not, and cannot.** T1 derived and confirmed that the Gear hash
+*freezes* at `-gear[b]` after 64 bytes of identical input, so no constant run of any of the 256 byte
+values can ever be cut by content (`CHALLENGES.md` B3). Sparse files and zero-padded images chunk at
+exactly `MaxSize`, 8× the assumed average.
+
+That is benign for bandwidth — the forced chunks are byte-identical, so they share one fingerprint
+and cost one payload — but it means **the per-chunk overhead arithmetic must be quoted per content
+class, never as a single number for the corpus.** `bench/wire_bytes` reports manifest bytes as their
+own line (§8.3) for exactly this reason.

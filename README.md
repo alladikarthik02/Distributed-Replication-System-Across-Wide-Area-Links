@@ -49,7 +49,7 @@ Randomized tests are seeded and print the seed; replay a failure with
 | Task | What | State |
 |---|---|---|
 | T0 | Foundations: container, CMake+CTest, harness, **measured platform + socket facts**, spec, bug journal | ✅ done |
-| T1 | Content primitives: SHA-256, CRC32C, FastCDC chunker | — |
+| T1 | Content primitives: SHA-256, CRC32C, FastCDC chunker | ✅ done |
 | T2 | Wire protocol: frame codec, CRC-before-use, varint, RLE need-set | — |
 | T3 | In-transit compression: LZ77-family compressor + bounds-safe decoder | — |
 | T4 | Lock-free queues: SPSC ring + bounded MPMC, vs a mutex baseline | — |

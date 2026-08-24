@@ -129,6 +129,101 @@ SPEC §2.5 now records both filesystems, S16's enforcement column includes the p
 
 ---
 
+## B3 🔬 A long run of one byte can *never* be cut — the Gear hash freezes after 64 bytes
+
+**Symptom.** The T1 chunker test reported, for three different fill bytes:
+
+```
+note: fill=0x00 -> 16 chunks, 16 forced at max (100%)
+note: fill=0xff -> 16 chunks, 16 forced at max (100%)
+note: fill=0x41 -> 16 chunks, 16 forced at max (100%)
+```
+
+Every single chunk of a constant-byte run hit the hard 64 KiB ceiling. Nothing failed —
+`min`/`max` were respected and the input tiled correctly — but "content-defined chunking
+never once let the content define a boundary" is the kind of clean 100% that is either a
+deep property or a bug, and 100% across three unrelated byte values ruled out
+coincidence immediately.
+
+**Hypotheses.**
+- (H1) An off-by-one in the mask regions — the loop never reaches the loose-mask branch,
+  so the easy-to-cut region is dead code. — *Rejected:* random data cuts constantly and
+  its measured distribution straddles `avg` (p50 = 9 198 B, above the 8 192 B boundary),
+  which is only reachable through the loose-mask branch.
+- (H2) The Gear table has poor entropy for these byte values. — *Rejected:* the table
+  test showed mean popcount 31.80/64 and all 256 entries distinct and non-zero. And it
+  would not explain identical behaviour across three unrelated values.
+- (H3) On constant input the hash stops depending on the data. — Correct, and much
+  stronger than "stops depending": it stops *moving*.
+
+**How I isolated it.** Unrolled the recurrence by hand instead of instrumenting.
+On a constant run, `h_{k+1} = (h_k << 1) + G` with `G = gear[b]`, so
+
+```
+h_0 = 0,  h_1 = G,  h_2 = 3G,  h_3 = 7G,  ...   h_k = (2^k - 1) * G   (mod 2^64)
+```
+
+and for `k >= 64`, `2^k ≡ 0 (mod 2^64)`, giving **`h_k = -G` for every k from 64 onward**.
+The hash does not become predictable — it becomes *constant*. So whether a constant run
+ever cuts is decided by a single question per byte value ("does `-G` match the mask?"),
+not by the data or its length.
+
+`scratch/spike_gear_constant.cpp` checked that against all 256 byte values:
+
+```
+closed form h_k = -G for k>=64 : CONFIRMED for all 256 byte values
+byte values whose steady hash matches mask_s (15 bits) : 0 / 256
+byte values whose steady hash matches mask_l (11 bits) : 0 / 256
+byte values that cut during the 63-byte warm-up        : 0 / 256
+```
+
+Zero out of 256. **No constant-byte run of any value can ever be cut by content.** The
+expected count is small by construction — 256 × 2⁻¹¹ ≈ 0.125 for the loose mask — so
+zero is the unremarkable outcome of arithmetic, not bad luck.
+
+**Root cause.** Not a defect. It is an inherent property of a shift-based rolling hash:
+the "window" exists only because old bytes shift off the top of the word, and when every
+byte is identical the sum telescopes to a fixed point. Rabin fingerprinting, which
+multiplies and reduces modulo an irreducible polynomial, does not have this fixed point.
+It is the price of the one-shift-one-add hot loop that made Gear the right choice.
+
+**Fix.** None to the chunker — but the *consequence* had to be understood before it could
+be dismissed, and it turned out to be benign for exactly one reason: **all those forced
+chunks are byte-identical.** A 1 GiB zero region becomes 16 384 chunks that share one
+fingerprint and collapse to a single stored chunk. The cost is bookkeeping (16 384
+manifest entries at 36 B ≈ 576 KiB), not payload. Recorded as:
+
+1. `chunker_constant_runs_produce_identical_max_size_chunks` — asserts the forced-cut
+   behaviour *and* that all such chunks are identical, so the benign-ness is a test, not
+   a comment.
+2. `gear_hash_freezes_on_a_constant_run_after_64_bytes` — asserts the closed form
+   directly, so a future change to the table or the shift width breaks the *reasoning*
+   loudly rather than leaving plausible-looking chunk sizes behind.
+3. SPEC §8.9 now says the chunk-size distribution must be measured **per content class**,
+   because "≈8 KiB average" is true for random data (measured mean 9 316 B) and false by
+   8× for sparse data.
+
+**Generalizes to.** A rolling hash's window is an emergent property of its arithmetic,
+not a thing it owns — so it is worth asking what happens at the arithmetic's fixed
+points. More usefully: when a measurement comes back at exactly 100% or exactly 0%, the
+explanation is almost never statistical. Derive it. Three minutes of unrolling a
+recurrence produced a complete answer where instrumenting the loop would have produced
+another table of numbers to interpret.
+
+**A note on the sibling result.** The boundary-preservation test reported exactly
+**100.00%** for content-defined chunking against **0.20%** for the fixed-size control, and
+those numbers deserved the same suspicion. They survive it: the Gear hash at modified
+position `i` depends only on bytes `[i-64, i-1]`, which is the identical window sitting at
+original position `i-1`, so 64 bytes past an insertion the two hash streams are the same
+sequence offset by one, and every downstream cut lands at exactly `original + 1`.
+Re-synchronisation is *exact*, not statistical. And the control's 0.20% is the same
+arithmetic backwards: 4 MiB / 8 KiB = 512 boundaries, of which exactly one survives —
+the end of the file — giving 1/512 = 0.195%. A control that returns precisely its
+predicted value is what proves the measurement is sound rather than accidentally always
+returning 100%.
+
+---
+
 ## Open questions carried into T2+
 
 - `WanLink`'s emulated RTT sits on top of a **2.6–10.2 µs** loopback baseline with p99

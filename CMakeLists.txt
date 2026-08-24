@@ -45,3 +45,13 @@ endfunction()
 
 # --- T0 -----------------------------------------------------------------------
 wanrep_test(test_harness)
+
+# --- T1: content primitives ---------------------------------------------------
+wanrep_test(test_sha256)
+wanrep_test(test_crc32c)
+wanrep_test(test_chunker)
+
+# Benchmarks are built, not run, by ctest -- they are measurements, not pass/fail
+# gates. Run them explicitly:  ./build-none/bench_chunker
+add_executable(bench_hash bench/bench_hash.cpp)
+add_executable(bench_chunker bench/bench_chunker.cpp)
