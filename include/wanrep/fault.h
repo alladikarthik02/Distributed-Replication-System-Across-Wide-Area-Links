@@ -16,11 +16,15 @@
 //   path takes a mutex and is only reached when a point is actually armed.
 #pragma once
 
+#include <unistd.h>
+
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 
 namespace wanrep {
 
@@ -153,7 +157,34 @@ inline FaultPlan& global_faults() {
   return p;
 }
 
+// Applies the kinds that are the SAME at every injection point, and returns the rest for
+// the call site to interpret.
+//
+// This exists because of a test that passed for the wrong reason. Each injection site
+// used to compare the returned kind against the one kind it knew how to handle --
+// `if (check(p) == FaultKind::kIoError) return err(...)` -- which silently made every
+// OTHER kind a no-op at that site. Arming kKillSelf at a point whose site only understood
+// kIoError consumed the fire and did nothing, so faultrunner reported the child as having
+// "exited" cleanly and the case still passed: the recovery path was never exercised, and
+// the row in the matrix was decoration.
+//
+// kKillSelf and kStall are meaningful at EVERY point, so they are handled here, once,
+// rather than depending on each site to remember them.
+inline FaultKind fault_check(FaultPoint point) {
+  const FaultKind k = global_faults().check(point);
+  if (k == FaultKind::kKillSelf) {
+    // The kill -9 case from the inside: no destructors, no flush, no FIN. 137 == 128 +
+    // SIGKILL, the shell's convention, so a runner reading the exit code sees the same
+    // number whether the process was killed from outside or from within.
+    ::_exit(137);
+  }
+  if (k == FaultKind::kStall) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  return k;
+}
+
 // Sugar for the production call sites, so an injection point reads as one line.
-#define WANREP_FAULT(point) ::wanrep::global_faults().check(point)
+#define WANREP_FAULT(point) ::wanrep::fault_check(point)
 
 }  // namespace wanrep

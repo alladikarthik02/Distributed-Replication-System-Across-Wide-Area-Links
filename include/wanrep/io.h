@@ -141,11 +141,15 @@ class File {
   }
 
   Result<void> fsync() {
-    // Injection point: a crash here means the data is written but not durable, which is
-    // the case S4's ordering exists to survive.
-    if (WANREP_FAULT(FaultPoint::kAfterChunkFsyncBeforeManifest) == FaultKind::kIoError) {
-      return err(Err::kFaultInjected, "fsync " + path_);
-    }
+    // Deliberately NOT an injection point.
+    //
+    // It was one, and that was a bug: File::fsync() is called by write_file_atomic(),
+    // which is called while CREATING THE STORE'S SUPERBLOCK. A fault armed here for
+    // "after the chunk data is durable" instead fired during startup and killed the
+    // target before it ever listened -- so the case tested process startup, not crash
+    // recovery. Injection points belong at the semantic moment they are named after, not
+    // at the lowest-level function that happens to be on the path to it. The point now
+    // lives in ChunkStore::sync().
     if (eintr_retry([&] { return ::fsync(fd_); }) != 0) return err_errno(Err::kIo, "fsync " + path_);
     return {};
   }

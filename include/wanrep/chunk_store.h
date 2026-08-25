@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "wanrep/crc32c.h"
+#include "wanrep/fault.h"
 #include "wanrep/io.h"
 #include "wanrep/result.h"
 #include "wanrep/sha256.h"
@@ -137,10 +138,18 @@ class ChunkStore {
   // Durability barrier. Called before a generation's manifest is published, so that no
   // reference can be published ahead of its data (SPEC S4).
   Result<void> sync() {
-    std::lock_guard<std::mutex> g(write_mu_);
-    if (!dirty_ || !active_) return {};
-    WANREP_TRY(active_->fsync());
-    dirty_ = false;
+    {
+      std::lock_guard<std::mutex> g(write_mu_);
+      if (!dirty_ || !active_) return {};
+      WANREP_TRY(active_->fsync());
+      dirty_ = false;
+    }
+    // The chunk data is durable and nothing references it yet. A crash HERE is the case
+    // SPEC S4's ordering exists to survive: the manifest has not been written, so the
+    // generation is invisible and the chunks are inert.
+    if (WANREP_FAULT(FaultPoint::kAfterChunkFsyncBeforeManifest) == FaultKind::kIoError) {
+      return err(Err::kFaultInjected, "after chunk fsync");
+    }
     return {};
   }
 

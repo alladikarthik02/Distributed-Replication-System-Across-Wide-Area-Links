@@ -484,6 +484,66 @@ from 55 to **203 of 332**.
 
 ---
 
+## B8 🐛 Two fault cases passed without injecting a fault
+
+**Symptom.** The first faultrunner run was all green:
+
+```
+kill_after_chunk_fsync                     exited     yes       PASS
+kill_after_manifest_fsync_before_commit    killed     yes       PASS
+kill_after_commit_before_ack               exited     yes       PASS
+6 cases run, 0 failed
+```
+
+Green, and wrong. Two rows say **`exited`** where the others say `killed`. Those children
+finished normally. The cases named "kill the target here" never killed anything, and the
+recovery path they exist to exercise was never entered.
+
+Worth stating plainly: I only caught this because the runner prints HOW the child died.
+Had it printed only PASS/FAIL, this would have shipped as two rows of decoration in the
+matrix that backs a headline claim.
+
+**Root cause (bug one).** Every injection site compared the returned kind against the one
+kind it happened to know about:
+
+```c++
+if (WANREP_FAULT(FaultPoint::kAfterChunkFsyncBeforeManifest) == FaultKind::kIoError) ...
+```
+
+`check()` consumes the fire and returns the kind. Arming `kKillSelf` at a site that only
+understood `kIoError` therefore burned the fire and did **nothing** -- silently, because
+there is no way for `arm()` to know what the far-off call site will accept.
+
+**Fix.** `kKillSelf` and `kStall` mean the same thing at every point, so they are handled
+once, centrally, in `fault_check()`, and `WANREP_FAULT` routes through it. A site now only
+interprets the kinds that are genuinely site-specific.
+
+**Root cause (bug two), found immediately after fixing bug one.** With the kill actually
+firing, the case failed differently: *"could not connect to the target"*. The injection
+point lived inside `File::fsync()` -- and `File::fsync()` is called by
+`write_file_atomic()`, which is called while creating the store's **superblock**. So a
+fault armed for "after the chunk data is durable" fired during startup and killed the
+child before it ever listened. The case would have been testing process startup.
+
+**Fix.** Move the point to `ChunkStore::sync()`, the semantic moment it is named after.
+
+**Generalizes to.** Three things:
+
+- **A fault-injection test must assert that the fault FIRED**, not merely that the system
+  survived. "Nothing went wrong" is the expected output of both a robust system and an
+  inert test, and those must not look alike. The runner reports the child's death mode in
+  every row for exactly this reason.
+- **An injection point belongs at the moment it is named after, not at the lowest-level
+  function on the path to it.** `File::fsync()` is on the path to "chunk data is durable",
+  and also on the path to a dozen unrelated things. Naming a point after a semantic event
+  and implementing it at a shared primitive means it fires in places nobody intended.
+- **Where a value is produced far from where it is interpreted, put the shared meaning in
+  the middle.** Each site independently remembering to handle each kind is a rule that
+  cannot be enforced and will silently rot; `fault_check()` makes the common cases
+  impossible to forget.
+
+---
+
 ## Open questions carried forward
 
 - `WanLink`'s emulated RTT sits on top of a **2.6–10.2 µs** loopback baseline with p99
