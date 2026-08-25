@@ -547,10 +547,11 @@ child before it ever listened. The case would have been testing process startup.
 ## B9 🐛 `try_push(T v)` ate the payload it refused to take
 
 **Found by the adversarial review pass on the queues, in code that had already passed its
-own test suite — and it was silently corrupting the replication pipeline.**
+own test suite.**
 
-**Symptom.** None. Every test was green. The end-to-end suite replicated trees
-byte-identically, `verify --deep` was clean, and the fault matrix passed.
+**Symptom.** None. Every test was green, and — this part matters — the measured numbers
+were unaffected: re-running the headline benchmark after the fix moved the seed transfer
+by 32 bytes, one frame. The bug was real and latent, not active.
 
 **The defect.** Both queues declared `bool try_push(T v)` — **by value**. A bounded queue
 forces every caller to write a retry loop, and the natural one is:
@@ -561,11 +562,20 @@ while (!q.try_push(std::move(v))) std::this_thread::yield();
 
 On the first attempt `v` is **moved into the parameter**. The push is refused because the
 queue is full, the parameter is destroyed, and every subsequent attempt pushes a
-moved-from husk. In `protocol.h` that husk is an empty `std::vector<uint8_t>` — a batch of
-chunk payloads that silently became zero bytes.
+moved-from husk. In `protocol.h` that husk is an empty `std::vector<uint8_t>`: a batch of
+chunk payloads that became zero bytes.
 
-**Why nothing caught it.** The bug only fires when a queue is **full**, and in the tests
-the queues never filled: T1 measured chunk+SHA-256 at 966 MB/s against a consumer that was
+**What it would actually have done — traced, not assumed.** An empty batch frame decodes
+to zero chunks, so the target marks nothing for those plan positions, the contiguous
+high-water mark never reaches the end of the plan, and `GEN_COMMIT` is **refused** with
+"chunks still missing". So the failure mode is a loud, correct refusal to commit — not
+silent data loss. The design holds: the target's completeness check does not trust the
+source to have sent what it claimed. That is worth stating precisely rather than
+inflating, because "this bug would have corrupted replicas" and "this bug would have
+failed transfers under load" are different claims and only the second one is true.
+
+**Why nothing caught it.** It only fires when a queue is **full**, and in the tests the
+queues never filled: T1 measured chunk+SHA-256 at 966 MB/s against a consumer that was
 never the bottleneck at test sizes. The whole failure lives in the backpressure path,
 which is the path that only matters under sustained load — i.e. in production.
 

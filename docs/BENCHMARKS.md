@@ -160,6 +160,35 @@ Round trips are **constant per generation, independent of dataset size** — whi
 number that predicts behaviour at an RTT we did not test (SPEC §3.2). A stop-and-wait
 design would have shown one round trip per chunk and collapsed here.
 
+
+### Lock-free queues vs a mutex baseline (R2.2) — the honest answer
+
+```bash
+./scripts/dev.sh ./build-none/bench_queues
+```
+
+SPEC §8.5 committed in advance to reporting whatever this said, including "no faster".
+It says no faster, and the *shape* of the result is the interesting part:
+
+| measurement | lock-free vs `std::mutex` + condvar |
+|---|---|
+| **Table 1** — synthetic: producers do nothing but push | **2.1× throughput** (geomean, range 1.2–3.7×) |
+| **Table 3** — realistic: T1's measured ~8.5 µs of chunk+SHA-256 per item | **0.97× throughput** (geomean, range 0.84–1.01×) |
+| **Table 3** — p99 push latency | **6.5× better** (geomean, best 29.7×) |
+| Slowest configuration measured anywhere | 108,411 items/s = **71×** what a 100 Mbit/s link can consume |
+
+Table 1 is the number it would be tempting to quote, and it would be false of this system:
+it gives the producer nothing to do but push, so the queue is 100% of the work and
+contention sits at its theoretical maximum. Restore the real upstream cost and the
+throughput advantage **drains away** — the signature of both queues being pinned by CPU
+cost rather than by the queue. The tail advantage survives.
+
+**So the second headline claim should be a design claim, not a performance claim.** On
+this workload the lock-free queues buy no throughput the link could ever use; what they
+buy is a bounded tail, no producer blocked by a descheduled peer, and memory bounded by
+construction. Quoting the 2.1× as a pipeline speedup would be true of the benchmark and
+false of the system.
+
 ### Resume cost (R2.4)
 
 ```bash
@@ -214,7 +243,22 @@ campaign. "About 60%" matches none of them — it understates two and overstates
 > backup corpus — 93% across an 8-generation campaign, measured on the socket rather than
 > estimated."
 
-Every other bullet stands as written and is backed above: lock-free queues on the hot path
-(T4, with the honest caveat in SPEC §8.5), resumable transfers recovering from a dropped
-connection rather than restarting (+8.7%, not +100%), and fault-injection tests that drop
-links and kill nodes mid-transfer with the target verified correct after every case.
+> **Bullet 2, as written:** "Handled concurrency with careful locking and lock-free queues
+> on the hot path, and added resumable transfers so a replication job recovered cleanly
+> from a dropped connection rather than restarting from the beginning."
+
+**This stands** — but only because it is already a *design* claim rather than a throughput
+one. Do not add a speed number to it: the measured throughput ratio against a mutex
+baseline is 0.97× under realistic per-item cost (the 2.1× is a property of the
+microbenchmark, not the pipeline). If a number is wanted, the defensible one is the tail:
+**6.5× better p99 push latency**, geomean. The resume half is backed by +8.7% rather than
++100%.
+
+> **Bullet 3, as written:** "Validated consistency and recovery through fault-injection
+> tests that dropped links and killed nodes mid-transfer, confirming the target stayed
+> correct after every simulated failure."
+
+**This stands as written**, and is the best-evidenced of the three: 8 named in-process
+fault points, 12 process-kill cases (`SIGKILL` from outside and `_exit` from inside, every
+child confirmed killed rather than exited — see `CHALLENGES.md` B8), 40 garbage payloads,
+and a hostile frame with a valid header CRC — all ending in the same oracle.
