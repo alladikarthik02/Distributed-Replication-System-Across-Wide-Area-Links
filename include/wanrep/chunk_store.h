@@ -208,8 +208,17 @@ class ChunkStore {
       }
     }
     for (const auto& s : shards_) {
-      std::shared_lock<std::shared_mutex> g(s.mu);
-      for (const auto& [fp, loc] : s.map) {
+      // Snapshot the shard, then release it before touching a file. Holding a shard lock
+      // across I/O would stall every concurrent lookup on that shard for the duration of
+      // a read -- and, worse, read_at() takes the container lock, which would invert the
+      // documented order (SPEC 3.6: shard -> container, never the reverse). TSan's
+      // lock-order graph caught exactly that inversion between this loop and recover().
+      std::vector<std::pair<Digest32, ChunkLoc>> snapshot;
+      {
+        std::shared_lock<std::shared_mutex> g(s.mu);
+        snapshot.assign(s.map.begin(), s.map.end());
+      }
+      for (const auto& [fp, loc] : snapshot) {
         rep.chunks++;
         auto bytes = read_at(loc, /*verify_fp=*/true);
         if (!bytes.ok()) {
@@ -398,6 +407,19 @@ class ChunkStore {
   // referenced by a committed generation, since chunk data is fsynced before any manifest
   // that names it is published (SPEC S4).
   Result<void> recover() {
+    // Entries are collected during the scan and inserted into the index AFTERWARDS,
+    // outside write_mu_. Inserting inline would take a shard lock while holding the
+    // container lock -- the exact inversion of SPEC 3.6's order, and a deadlock against
+    // any concurrent reader that goes shard-then-container. It is not merely theoretical
+    // because verify() and get() are both allowed to run while a rebuild_index() is in
+    // progress.
+    std::vector<std::pair<Digest32, ChunkLoc>> found;
+    auto result = scan_containers(found);
+    for (auto& [fp, loc] : found) insert_index(fp, loc);
+    return result;
+  }
+
+  Result<void> scan_containers(std::vector<std::pair<Digest32, ChunkLoc>>& found) {
     std::lock_guard<std::mutex> g(write_mu_);
     containers_.clear();
     damage_.clear();
@@ -417,11 +439,7 @@ class ChunkStore {
       while (off + sizeof(ChunkRecordHeader) <= file_size) {
         ChunkRecordHeader h{};
         if (parse_record_at(*shared, off, file_size, h)) {
-          Shard& s = shard_for(h.fp);
-          {
-            std::unique_lock<std::shared_mutex> sg(s.mu);
-            s.map.emplace(h.fp, ChunkLoc{id, off, h.length});
-          }
+          found.emplace_back(h.fp, ChunkLoc{id, off, h.length});
           off += sizeof(ChunkRecordHeader) + h.length;
           total_bytes_ += h.length;
           continue;

@@ -544,6 +544,130 @@ child before it ever listened. The case would have been testing process startup.
 
 ---
 
+## B9 🐛 `try_push(T v)` ate the payload it refused to take
+
+**Found by the adversarial review pass on the queues, in code that had already passed its
+own test suite — and it was silently corrupting the replication pipeline.**
+
+**Symptom.** None. Every test was green. The end-to-end suite replicated trees
+byte-identically, `verify --deep` was clean, and the fault matrix passed.
+
+**The defect.** Both queues declared `bool try_push(T v)` — **by value**. A bounded queue
+forces every caller to write a retry loop, and the natural one is:
+
+```c++
+while (!q.try_push(std::move(v))) std::this_thread::yield();
+```
+
+On the first attempt `v` is **moved into the parameter**. The push is refused because the
+queue is full, the parameter is destroyed, and every subsequent attempt pushes a
+moved-from husk. In `protocol.h` that husk is an empty `std::vector<uint8_t>` — a batch of
+chunk payloads that silently became zero bytes.
+
+**Why nothing caught it.** The bug only fires when a queue is **full**, and in the tests
+the queues never filled: T1 measured chunk+SHA-256 at 966 MB/s against a consumer that was
+never the bottleneck at test sizes. The whole failure lives in the backpressure path,
+which is the path that only matters under sustained load — i.e. in production.
+
+**Fix.** `try_push(T&& v)`. An rvalue reference *binds* without consuming, so a refused
+push leaves the caller's object intact and the obvious retry loop becomes the correct one.
+The fix is in the queue, and `protocol.h` needed no change at all — which is the right
+place for it: every future caller would have written the same loop and hit the same bug.
+
+**Generalizes to.** **A fallible sink must not take ownership of what it refuses.** If a
+function can say "no", its signature has to leave the caller holding the thing it still
+owns. By-value is a promise to consume; a function that consumes on failure has a
+signature that contradicts its contract, and no amount of care at the call site fixes it.
+More generally: a bug that only manifests under backpressure will not appear in a test
+whose queues never fill, so "the suite is green" says nothing about the saturated path.
+
+---
+
+## B10 🌐 An 11-byte reply could have killed the source process
+
+**Found by the adversarial review pass on the wire protocol. Remotely reachable from an
+unauthenticated peer (SPEC §8.7 says there is no authentication) — the highest-severity
+defect in the project.**
+
+**The defect.** `NeedSet::decode()` bounded the total number of indices like this:
+
+```c++
+len = len_minus_1 + 1;
+if (len > kMaxNeedIndices - total) return err(Err::kTooLarge, ...);
+```
+
+With `len_minus_1 = 2^64 - 1`, `len` wraps to **0**. Zero is not greater than anything, so
+the cap check passes, and the run "0 .. 2^64-1" — the entire index space — is accepted.
+The eleven bytes `00 FF FF FF FF FF FF FF FF FF 01` are enough.
+
+The run representation itself is compact, so the decode survives. The kill lands later:
+`protocol.h` → `build_send_plan()` → `NeedSet::to_vector()`, which materializes 2^64
+indices and takes the **source** process down by unbounded allocation. A malicious target
+kills the machine that connected to it.
+
+**Fix.** Do the arithmetic entirely in the domain that cannot wrap:
+`if (len_minus_1 >= kMaxNeedIndices - total)`. Regression test verified to fail before and
+pass after, plus neighbours proving it is a fix and not a special case: `UINT64_MAX - 1`
+still rejected, a legal 2-index run at the very top of the space still accepted, and a run
+exactly at the cap still legal.
+
+**Generalizes to.** **`x + 1` is not a safe way to convert a length-minus-one, and the
+overflow is invisible at the call site.** The check *looked* right — it named the cap, it
+subtracted the running total, it returned the correct error code. Every part was correct
+except the domain the arithmetic happened in. When a validator is written in terms of a
+value derived from untrusted input, do the comparison on the raw value, not on something
+computed from it.
+
+And a note on where this was found: the building agent wrote a thorough suite, including
+random fuzzing of the decoder. Uniform-random bytes essentially never produce a 10-byte
+varint, so random fuzzing could not reach this input. It took a *structured* fuzzer that
+deliberately emits well-formed varint pairs drawn from adversarial magnitudes. Random
+fuzzing explores the middle of the input space; the bugs live at its edges.
+
+---
+
+## B11 ⚔️ The lock order I wrote down, violated in my own code
+
+**Symptom.** With every suite otherwise green, TSan reported on `test_store`:
+
+```
+WARNING: ThreadSanitizer: lock-order-inversion (potential deadlock)
+  Cycle in lock order graph: M0 => M1 => M0
+```
+
+**Root cause.** SPEC §3.6 states one global rule: `session mutex -> index shard ->
+container writer`, never the reverse. Two functions disagreed about it:
+
+- `recover()` held the container lock (`write_mu_`) and then took index shard locks to
+  populate the index — **container → shard**.
+- `verify()` held a shard lock while iterating and called `read_at()`, which takes the
+  container lock — **shard → container**.
+
+Either alone is fine. Together they are a cycle, and `verify()` is explicitly allowed to
+run while a `rebuild_index()` is in progress, so it is reachable rather than theoretical.
+
+Worth noting how it was caught: both stacks were on the **main thread**, at different
+moments, in a test that never ran them concurrently. TSan builds a global lock-order graph
+rather than waiting to observe an actual deadlock — which is why a deadlock that needs a
+rare interleaving is findable at all.
+
+**Fix.** Neither function needs to hold both.
+- `recover()` collects `(fingerprint, location)` pairs during the scan and inserts them
+  into the index **after** releasing the container lock.
+- `verify()` snapshots each shard, releases it, and only then does file I/O — which also
+  removes a shard lock held across a read, something `chunk_store.h`'s own comment already
+  said not to do.
+
+**Generalizes to.** **Writing the lock order down is necessary and nowhere near
+sufficient.** I wrote that rule in the spec in T0, cited it in comments, and then broke it
+in T6 in a function whose whole job is to run before anything is shared — which is exactly
+the reasoning that makes it feel safe to break. The rule needs a *tool* enforcing it, and
+TSan's lock-order graph is that tool: it found the cycle from two stacks that never ran at
+the same time. Also: the fix in both cases was to hold *one lock instead of two*, which is
+usually available and usually better than getting the order right.
+
+---
+
 ## Open questions carried forward
 
 - `WanLink`'s emulated RTT sits on top of a **2.6–10.2 µs** loopback baseline with p99
