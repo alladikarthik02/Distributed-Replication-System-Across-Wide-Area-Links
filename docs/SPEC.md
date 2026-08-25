@@ -291,11 +291,19 @@ and "a corrupt frame is a 4 GiB allocation."
 | `MANIFEST` | S→T | negotiation | The generation's manifest, streamed across as many frames as needed. |
 | `NEED` | T→S | negotiation | Run-length-encoded indices into the canonical chunk list (§3.3). |
 | `CHUNKS` | S→T | transfer | A compressed batch of chunk payloads, tagged with a plan `seq`. |
-| `CHECKPOINT` | T→S | transfer | Contiguous high-water mark; advisory, sent periodically. |
+| `CHECKPOINT` | T→S | transfer | Defined, but **not sent** — see below. |
 | `GEN_COMMIT` | S→T | commit | All needed chunks sent; please commit generation G. |
 | `COMMIT_ACK` | T→S | commit | Commit record is durable. Only now is the generation replicated. |
 | `ERROR` | either | any | Code + message. A node that cannot continue says so instead of hanging up silently. |
 | `BYE` | either | teardown | Orderly shutdown, so `read()==0` means "finished" and not "died" (§2.5). |
+
+**Why `CHECKPOINT` is defined and never sent (amended during T8).** The source never needs it: on
+reconnect the target reports its position in `SESSION_ACK`, which is the only moment the number is
+used. Sending it created a genuine deadlock: the source streams chunks without reading, so unread
+`CHECKPOINT` frames accumulate in the target's send buffer; once that buffer fills the target blocks
+in `write()`, stops reading chunks, and both sides wedge. At one frame per 8 MiB against a 64 KiB
+buffer that is ~13 GiB into a transfer — rare enough to pass every test, certain enough to happen in
+production. The frame type stays defined so the wire format does not have a hole in it.
 
 **Framing rules.** Every frame is self-delimiting and every payload is CRC-checked. `kMaxFrame` is
 1 MiB, which bounds receiver memory per connection regardless of what the peer claims. A frame that
@@ -305,15 +313,24 @@ becomes a corrupted replica.
 
 ### 3.3 Delta negotiation — how "only changed chunks" actually works
 
-Two levels, cheapest first.
+**AMENDED DURING T7 — the store is the authority, not the previous manifest.** This section
+originally described a two-level scheme in which files whose path, size, mode, mtime and digest all
+matched generation G−1 were skipped *without probing the chunk store*, on the reasoning that a
+committed generation implies its chunks are present. That reasoning is correct and the optimization
+is still wrong. The probe is an in-memory hash lookup — ~40 ms for four million chunks, against a
+transfer measured in minutes — and skipping it costs **self-healing**: a chunk lost to bit rot
+(which recovery can now detect and report, `CHALLENGES.md` B4) would never be re-requested, and the
+target would stay silently broken. So every chunk is probed, and the previous manifest is compared
+only to *attribute* the saving (unchanged files vs chunk dedup), which §8.1 requires anyway.
+`test_negotiate` proves the consequence directly: an unchanged file with one corrupted chunk
+re-requests exactly that chunk.
 
-**Level 1 — unchanged files cost nothing.** The manifest for generation G is diffed by the target
-against its manifest for generation G−1. A file whose path, size, mode, mtime **and whole-file
-SHA-256** all match is skipped entirely; none of its chunks are even probed. (The digest is in the
-comparison on purpose: mtime and size agreeing is a heuristic, and heuristics are how backup tools
-silently miss changed data.)
+**Level 1 — unchanged files, for attribution.** A file whose path, size, mode, mtime **and
+whole-file SHA-256** all match the previous generation is counted as unchanged. (The digest is in
+the comparison on purpose: mtime and size agreeing is a heuristic, and heuristics are how backup
+tools silently miss changed data.) This decides what the benchmark *reports*, not what is sent.
 
-**Level 2 — the set difference over chunks.** For every remaining file, the target probes its local
+**Level 2 — the set difference over chunks, which decides what is actually sent.** For every remaining file, the target probes its local
 chunk index for each fingerprint. Missing fingerprints become the request. Because the index covers
 *every chunk the target has ever stored*, this automatically handles the cases a file-level diff
 cannot: a renamed file (same chunks, new path) sends nothing; a file assembled from pieces of other
@@ -478,12 +495,28 @@ arrivals sit in a small bitmap window until they become contiguous. The mark is 
 `sessions/<id>.ses` (fsynced) every `kCheckpointBytes`, and sent to the source as an advisory
 `CHECKPOINT` frame.
 
+**AMENDED DURING T9 — resuming is just re-negotiating without re-sending the manifest.**
+The design above (keep the plan, remember how far it got, restart at that index) was measured and
+found to be *slower than its own fallback* (`CHALLENGES.md` B7). Two reasons: batches are compressed
+on several threads and therefore arrive **out of order**, so one missing early batch pins the
+contiguous mark near zero and the source re-sends everything above it — including chunks the target
+already holds; and checkpoints are written every 8 MiB, so any transfer smaller than that resumed
+from zero outright.
+
 **On reconnect,** the source sends `SESSION_RESUME(session_id)`:
 
-- **Fast path** — the target knows the session: it replies with the durable high-water mark and the
-  source resumes at that plan index. One round trip, no re-negotiation, no re-scan.
-- **Fallback** — the session is unknown, the checkpoint is stale, or the manifest digest does not
-  match: the target replies `NOT_FOUND` and the source re-runs negotiation from §3.3.
+- **Known session** — the target re-runs the set difference of §3.3 against its own store and replies
+  with a fresh need set. Everything already received drops out regardless of arrival order, of
+  checkpoint cadence, and even of a chunk having been lost to corruption since (it is simply
+  re-requested). Both sides rebuild the plan from that need set, so the plan requires no stability
+  guarantee at all. What is saved is the expensive half: **the manifest is already on the target and
+  is not sent again** — which on a large tree *is* the cost (§8.3).
+- **Unknown session** — the target says so and the source re-negotiates from scratch, re-sending the
+  manifest. Still not a restart, for the same reason: the set difference excludes everything already
+  stored.
+
+Measured: a mid-transfer drop costs **+8.7%** over a clean run rather than +100%; with the session
+file deleted entirely the target still skips 203 of 332 chunks.
 
 **Why the fallback is not a restart, and this is the important part.** Re-negotiation asks the
 target which chunks it needs *now* — and the chunks that already arrived are in its store, so it
@@ -493,8 +526,9 @@ The checkpoint saves two round trips; content addressing saves the data. That is
 paying for itself, and it is why `test_resume` includes a case that deliberately deletes the session
 file before reconnecting and still asserts that almost nothing is re-sent.
 
-**Bounded re-send.** After a fast-path resume, the bytes re-sent are at most
-`kCheckpointBytes + in-flight window`. That bound is asserted, and the measured value is reported.
+**Bounded re-send.** What gets re-sent is whatever was in flight when the link died — the target
+cannot have stored a batch it never fully received. Measured and asserted in `test_resume` against a
+clean-run baseline.
 
 ### 3.8 The WAN link emulator and fault injection
 
@@ -753,6 +787,24 @@ The consequences are scoped deliberately:
 The general lesson, recorded because it is the kind of thing that is obvious only
 afterwards: a POSIX call succeeding is not evidence that it did anything. `flock`
 returned 0 both times.
+
+### 8.11 Three design decisions were changed by measurement, and the spec says so
+
+This document is described in §0 as living, and three sections above carry an AMENDED note rather
+than a quiet rewrite. That is deliberate: the reasoning that was wrong is more instructive than the
+version that replaced it, and an interview question about any of them is a better story than a spec
+that always agreed with itself.
+
+| § | original design | what measurement said | now |
+|---|---|---|---|
+| 3.2 | `CHECKPOINT` sent back periodically, advisory | it deadlocks at ~13 GiB: the source streams without reading, the target's send buffer fills, both wedge | defined, never sent |
+| 3.3 | skip probing for files unchanged since G−1 | saves ~40 ms and costs self-healing against bit rot | probe everything; the store is the authority |
+| 3.7 | resume at a durable plan index | slower than its own fallback (`CHALLENGES.md` B7) | resume = re-negotiate, manifest not re-sent |
+
+The pattern in all three is the same, and it is the one worth taking away: each was an optimization
+that introduced a **second source of truth** — a checkpoint, a previous manifest, a remembered plan
+position — alongside the one that was already correct, which is the target's own store. Every time,
+deleting the second source made the system smaller *and* faster.
 
 ### 8.9 Chunk-size distribution is a property of the content, and T1 measured how much
 
