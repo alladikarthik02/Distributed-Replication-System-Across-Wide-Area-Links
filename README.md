@@ -50,13 +50,42 @@ Randomized tests are seeded and print the seed; replay a failure with
 |---|---|---|
 | T0 | Foundations: container, CMake+CTest, harness, **measured platform + socket facts**, spec, bug journal | ✅ done |
 | T1 | Content primitives: SHA-256, CRC32C, FastCDC chunker | ✅ done |
-| T2 | Wire protocol: frame codec, CRC-before-use, varint, RLE need-set | — |
-| T3 | In-transit compression: LZ77-family compressor + bounds-safe decoder | — |
-| T4 | Lock-free queues: SPSC ring + bounded MPMC, vs a mutex baseline | — |
-| T5 | Link layer: TCP, WAN emulator, fault injection | — |
-| T6 | Target store: chunk containers, index, manifests, generation journal | — |
-| T7 | Manifest & negotiation: the set difference | — |
-| T8 | End-to-end replication + CLI | — |
-| T9 | Resumable transfers | — |
-| T10 | Fault injection matrix: link drops and node kills | — |
-| T11 | Benchmarks — the headline numbers — and reconciliation | — |
+| T2 | Wire protocol: frame codec, CRC-before-use, varint, RLE need-set | ✅ done |
+| T3 | In-transit compression: LZ77-family compressor + bounds-safe decoder | ✅ done |
+| T4 | Lock-free queues: SPSC ring + bounded MPMC, vs a mutex baseline | ✅ done |
+| T5 | Link layer: TCP, WAN emulator, fault injection | ✅ done |
+| T6 | Target store: chunk containers, index, manifests, generation journal | ✅ done |
+| T7 | Manifest & negotiation: the set difference | ✅ done |
+| T8 | End-to-end replication + CLI | ✅ done |
+| T9 | Resumable transfers | ✅ done |
+| T10 | Fault injection matrix: link drops and node kills | ✅ done |
+| T11 | Benchmarks — the headline numbers — and reconciliation | ✅ done |
+
+## The numbers
+
+Full detail, with the workload printed beside every figure, in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+| | measured |
+|---|---|
+| Bandwidth, initial seed sync | **52.8% reduction** |
+| Bandwidth, incremental generations | **98.9% reduction** |
+| Bandwidth, 8-generation campaign | **93.0% reduction** |
+| Cost of a mid-transfer link drop | **+8.7%** over a clean run (a restart would be +100%) |
+| Round trips per generation | **3–5, independent of dataset size** |
+| Fault matrix | 8 named in-process points + 12 process-kill cases, all verified by one oracle |
+
+Every bandwidth figure is read from `Link::bytes_out()` — the transport's own byte counter,
+including all protocol overhead — never modelled from chunk sizes.
+
+## Try it
+
+```bash
+# terminal 1: a target, on container-local storage (see the caveat below)
+./scripts/dev.sh ./build-none/wanrep target serve --store /tmp/store --listen 127.0.0.1:9000
+
+# terminal 2: replicate a tree, then check and rebuild it
+./scripts/dev.sh ./build-none/wanrep source replicate --tree ./docs --peer 127.0.0.1:9000 --dataset docs
+./scripts/dev.sh ./build-none/wanrep target verify --store /tmp/store --deep
+./scripts/dev.sh ./build-none/wanrep target materialize --store /tmp/store --dataset docs --gen 0 --out /tmp/out
+```

@@ -43,7 +43,7 @@ function(wanrep_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-# --- T0 -----------------------------------------------------------------------
+# --- T0: foundations ----------------------------------------------------------
 wanrep_test(test_harness)
 
 # --- T1: content primitives ---------------------------------------------------
@@ -51,7 +51,49 @@ wanrep_test(test_sha256)
 wanrep_test(test_crc32c)
 wanrep_test(test_chunker)
 
-# Benchmarks are built, not run, by ctest -- they are measurements, not pass/fail
-# gates. Run them explicitly:  ./build-none/bench_chunker
+# --- T2: wire protocol --------------------------------------------------------
+wanrep_test(test_frame)
+
+# --- T3: in-transit compression -----------------------------------------------
+wanrep_test(test_compress)
+
+# --- T4: lock-free queues -----------------------------------------------------
+wanrep_test(test_queues)
+
+# --- T5: link layer -----------------------------------------------------------
+wanrep_test(test_link)
+
+# --- T6: target store ---------------------------------------------------------
+wanrep_test(test_store)
+
+# --- T7: manifests and negotiation --------------------------------------------
+wanrep_test(test_negotiate)
+
+# --- T8: end-to-end replication -----------------------------------------------
+wanrep_test(test_replicate)
+
+# --- T9: resumable transfers --------------------------------------------------
+wanrep_test(test_session)
+wanrep_test(test_resume)
+
+# --- T10: fault injection -----------------------------------------------------
+wanrep_test(test_faults)
+
+# The CLI.
+add_executable(wanrep src/main.cpp)
+target_link_libraries(wanrep PRIVATE pthread)
+
+# Tools. faultrunner forks real target processes and kills them, so it is a TOOL rather
+# than a ctest case -- it is run explicitly and prints a matrix.
+add_executable(faultrunner tools/faultrunner.cpp)
+target_link_libraries(faultrunner PRIVATE pthread)
+
+# Benchmarks are built, not run, by ctest -- they are measurements, not pass/fail gates.
+# Run them explicitly:  ./build-none/bench_chunker
 add_executable(bench_hash bench/bench_hash.cpp)
 add_executable(bench_chunker bench/bench_chunker.cpp)
+add_executable(bench_lz bench/bench_lz.cpp)
+add_executable(bench_queues bench/bench_queues.cpp)
+target_link_libraries(bench_queues PRIVATE pthread)
+add_executable(bench_wire bench/bench_wire.cpp)
+target_link_libraries(bench_wire PRIVATE pthread)
