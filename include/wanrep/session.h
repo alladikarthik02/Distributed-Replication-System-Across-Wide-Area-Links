@@ -183,9 +183,40 @@ class SessionJournal {
     return decode(ByteSpan(bytes->data(), bytes->size()));
   }
 
+
+  // The send plan must be STABLE across a resume, and that turns out to be the subtle
+  // part of resumability. A plan index is a position in the ascending list of NEEDED
+  // chunks -- so if the target re-derived the need set after a restart, chunks that had
+  // already arrived would drop out, every later index would shift down, and the durable
+  // high-water mark would suddenly point at a different chunk. The transfer would resume
+  // in the wrong place and report success with data missing.
+  //
+  // So the manifest and the need set that DEFINED the plan are persisted with the
+  // checkpoint. They are still performance-only state: losing them means re-negotiating
+  // (SPEC 3.7's fallback), which is correct, just two round trips more expensive.
+  Result<void> save_blobs(const std::string& id, ByteSpan manifest, ByteSpan need) {
+    if (!valid_session_id(id)) return err(Err::kInvalidArgument, "session id");
+    WANREP_TRY(write_file_atomic(dir_ + "/" + id + ".man", manifest));
+    return write_file_atomic(dir_ + "/" + id + ".need", need);
+  }
+
+  Result<std::vector<uint8_t>> load_manifest_blob(const std::string& id,
+                                                  size_t max_bytes) const {
+    if (!valid_session_id(id)) return err(Err::kInvalidArgument, "session id");
+    return read_whole_file(dir_ + "/" + id + ".man", max_bytes);
+  }
+
+  Result<std::vector<uint8_t>> load_need_blob(const std::string& id,
+                                              size_t max_bytes) const {
+    if (!valid_session_id(id)) return err(Err::kInvalidArgument, "session id");
+    return read_whole_file(dir_ + "/" + id + ".need", max_bytes);
+  }
+
   Result<void> erase(const std::string& id) {
     if (!valid_session_id(id)) return err(Err::kInvalidArgument, "session id");
     ::unlink(path_for(id).c_str());
+    ::unlink((dir_ + "/" + id + ".man").c_str());
+    ::unlink((dir_ + "/" + id + ".need").c_str());
     return {};
   }
 

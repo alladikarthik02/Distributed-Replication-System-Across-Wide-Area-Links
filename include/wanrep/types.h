@@ -117,8 +117,14 @@ enum class FrameType : uint8_t {
   kBye           = 13,  // both  orderly shutdown, so read()==0 means "done" not "died"
 };
 
-// Frame flags (bitmask in FrameHeader::flags).
+// Frame flags (bitmask in FrameHeader::flags). These are part of the WIRE CONTRACT, and
+// the frame codec rejects any bit not listed here -- so a flag invented by a higher layer
+// has to be declared, not merely used.
 inline constexpr uint8_t kFlagCompressed = 1u << 0;  // payload is an LZ block (SPEC 3.4)
+// Set on the final slice of a blob (a manifest or a need set) that spans several frames.
+// It lives here rather than in the protocol layer because the codec has to know it is a
+// legal bit; see docs/CHALLENGES.md B6.
+inline constexpr uint8_t kFlagLastSlice = 1u << 1;
 
 // 'W','R','P','1' read as a little-endian uint32. Serves two purposes: it pins the
 // protocol version into every frame, and it is a recognisable eye-catcher in a hexdump

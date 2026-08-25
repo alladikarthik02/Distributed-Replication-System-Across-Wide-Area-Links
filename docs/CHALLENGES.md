@@ -334,6 +334,71 @@ where the rule matters most.
 
 ---
 
+## B6 🌐 Every frame rejected: a protocol layer used a flag the wire contract never declared
+
+**Symptom.** The first end-to-end test run failed at the very first frame, in all seven
+tests at once:
+
+```
+REQUIRE(rr.stats.ok())                                          -- aborting test
+REQUIRE(proto::send_blob(w, FrameType::kManifest, ...).ok())    -- aborting test
+```
+
+Nothing had been transferred. Every single write failed.
+
+**Hypotheses.**
+- (H1) The framing layer was broken -- it had been written by a different agent working in
+  parallel and integrated without ever being exercised by this code. — *Rejected quickly,
+  and it was the tempting one:* its own test suite passed, and a defect that broke EVERY
+  write would have failed those too.
+- (H2) A `MemoryLink` deadlock, since the target runs on another thread. — *Rejected:* the
+  failure also occurred on the very first `write()`, before the target had done anything,
+  and it was an error return rather than a hang.
+- (H3) An argument the frame writer rejects. — Correct. "Every call fails identically"
+  points at the *contract*, not at the machinery.
+
+**How I isolated it.** Read `FrameWriter::write()` looking for what it validates rather
+than what it does. Four lines in:
+
+```c++
+if ((flags & ~kKnownFrameFlags) != 0) return err(Err::kInvalidArgument, "unknown frame flag bits");
+...
+inline constexpr uint8_t kKnownFrameFlags = kFlagCompressed;
+```
+
+The protocol layer had invented `kFlagLastSlice = 1u << 1` to mark the final slice of a
+manifest that spans several frames. The codec knew only about bit 0.
+
+**Root cause.** An ownership seam. `types.h` declares the wire contract; `frame.h`
+enforces it; `protocol.h` was written afterwards and added a flag bit to the *wire* while
+only telling *itself*. The codec's strictness was correct -- reserved bits must be zero,
+or they can never safely be assigned later -- so the bug was entirely on the side that
+used an undeclared bit.
+
+**Fix.** Declare the flag where the contract lives, not where it is used: `kFlagLastSlice`
+moved into `types.h` beside `kFlagCompressed`, and `kKnownFrameFlags` became
+`kFlagCompressed | kFlagLastSlice`. `protocol.h` now carries a comment saying where the
+bit is defined and why it is not defined locally.
+
+Deliberately NOT fixed by relaxing the check to allow unknown bits. That would have made
+the symptom disappear and quietly destroyed the ability to add a flag later without
+breaking older peers -- trading a loud five-minute bug for a silent compatibility one.
+
+**Generalizes to.** Two things, and the second is about how this was built:
+
+- **When every call fails identically, suspect the contract, not the code.** A machinery
+  bug is usually input-dependent; a contract violation is uniform. That distinction cut
+  the search from "read the whole framing layer" to "read its argument validation".
+- **Parallel work needs the shared vocabulary to be owned by one place.** Four components
+  were built concurrently against a written interface spec, and this is precisely the seam
+  where that goes wrong: each side was individually correct and locally tested, and the
+  disagreement existed only in the space between them. It surfaced at first integration,
+  which is the cheapest moment it could have -- but the general lesson is that a
+  constant shared across a boundary belongs in the header that DEFINES the boundary, and
+  a layer that needs a new one has to go and add it there.
+
+---
+
 ## Open questions carried forward
 
 - `WanLink`'s emulated RTT sits on top of a **2.6–10.2 µs** loopback baseline with p99
