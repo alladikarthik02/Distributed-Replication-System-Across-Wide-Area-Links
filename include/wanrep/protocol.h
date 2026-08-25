@@ -265,6 +265,20 @@ class TargetServer {
     uint64_t since_checkpoint = 0;
   };
 
+  // The most recent committed manifest for a dataset, or null if there is none. Used only
+  // to ATTRIBUTE savings (unchanged files vs chunk dedup) -- the store, not this, decides
+  // what is actually needed. See negotiate.h.
+  const Manifest* load_previous(const std::string& dataset, Manifest& storage) {
+    auto latest = store_.generations().latest_generation(dataset);
+    if (!latest.ok()) return nullptr;
+    auto pb = store_.generations().manifest_bytes(dataset, *latest);
+    if (!pb.ok()) return nullptr;
+    auto pm = Manifest::decode(ByteSpan(pb->data(), pb->size()));
+    if (!pm.ok()) return nullptr;
+    storage = std::move(*pm);
+    return &storage;
+  }
+
   static Result<void> send_error(FrameWriter& w, Err code, const std::string& msg) {
     std::vector<uint8_t> p;
     put_varint(p, static_cast<uint64_t>(code));
@@ -306,16 +320,8 @@ class TargetServer {
     s.manifest = std::move(*m);
 
     // --- negotiate: the set difference (SPEC 3.3) ---
-    const Manifest* previous = nullptr;
     Manifest prev_storage;
-    if (auto latest = store_.generations().latest_generation(s.dataset); latest.ok()) {
-      if (auto pb = store_.generations().manifest_bytes(s.dataset, *latest); pb.ok()) {
-        if (auto pm = Manifest::decode(ByteSpan(pb->data(), pb->size())); pm.ok()) {
-          prev_storage = std::move(*pm);
-          previous = &prev_storage;
-        }
-      }
-    }
+    const Manifest* previous = load_previous(s.dataset, prev_storage);
     const auto neg = negotiate(s.manifest, previous, store_.chunks());
     s.canonical = canonical_chunk_list(s.manifest);
     s.plan = neg.need.to_vector();
@@ -372,8 +378,7 @@ class TargetServer {
 
     auto m = Manifest::decode(ByteSpan(mb->data(), mb->size()));
     if (!m.ok()) return m.error();
-    auto need = NeedSet::decode(ByteSpan(nb->data(), nb->size()));
-    if (!need.ok()) return need.error();
+    (void)nb;  // the stored need set is kept only for forensics; see below
 
     Live s;
     s.session_id = id;
@@ -382,19 +387,47 @@ class TargetServer {
     s.manifest_digest = st->manifest_digest;
     s.manifest = std::move(*m);
     s.canonical = canonical_chunk_list(s.manifest);
-    s.plan = need->to_vector();
     s.bytes_received = st->bytes_received;
-    if (st->plan_size != s.plan.size()) return err(Err::kCorrupt, "plan size changed");
-    s.tracker = std::make_unique<HighWaterTracker>(s.plan.size(), st->high_water);
+
+    // RESUMING IS JUST RE-NEGOTIATING WITHOUT RE-SENDING THE MANIFEST
+    // (docs/CHALLENGES.md B7).
+    //
+    // The obvious design -- keep the original plan, remember how far it got, restart there
+    // -- was wrong twice over. Batches are compressed on several threads and therefore
+    // arrive OUT OF ORDER, so one missing early batch pins the contiguous mark near zero
+    // and "resume" re-sends everything after it, INCLUDING chunks the target already
+    // holds. And checkpoints are written every 8 MiB, so a smaller transfer resumed from
+    // zero outright. Measured: the fast path was slower than the session-deleted fallback,
+    // which re-ran the set difference and correctly skipped what had landed. The
+    // optimization was losing to the thing it was optimizing.
+    //
+    // So resume does what the fallback does: recompute the set difference against the
+    // store, which is authoritative. Everything already received drops out no matter what
+    // order it arrived in, no matter when the last checkpoint was, and even if a chunk was
+    // lost to corruption since (it is simply re-requested). The plan is rebuilt from that
+    // fresh need set on both sides, so it needs no stability guarantee at all -- which
+    // deletes the whole class of bug rather than patching it.
+    //
+    // What resume still saves is the expensive half: the manifest is already here, so it
+    // is not re-sent. On a large tree that IS the cost (SPEC 8.3).
+    Manifest prev_storage;
+    const Manifest* previous = load_previous(s.dataset, prev_storage);
+    const auto neg = negotiate(s.manifest, previous, store_.chunks());
+    s.plan = neg.need.to_vector();
+    const uint64_t already = (st->plan_size > s.plan.size()) ? st->plan_size - s.plan.size() : 0;
+    s.tracker = std::make_unique<HighWaterTracker>(s.plan.size(), 0);
+
+    const auto need_bytes = neg.need.encode();
+    WANREP_TRY(sessions_.save_blobs(id, ByteSpan(mb->data(), mb->size()),
+                                    ByteSpan(need_bytes.data(), need_bytes.size())));
+    WANREP_TRY(save_checkpoint(s));
 
     std::vector<uint8_t> p;
     proto::put_str(p, id);
-    put_varint(p, st->high_water);
+    put_varint(p, already);  // how many plan entries this resume skipped, for reporting
     WANREP_TRY(writer.write(FrameType::kSessionAck, 0, ByteSpan(p.data(), p.size())));
-    // The need set comes back too, so a source process that RESTARTED (and therefore lost
-    // its plan) can rebuild it from its own re-scanned manifest plus this. Without it,
-    // only a source that stayed alive across the drop could take the fast path.
-    WANREP_TRY(proto::send_blob(writer, FrameType::kNeed, ByteSpan(nb->data(), nb->size())));
+    WANREP_TRY(proto::send_blob(writer, FrameType::kNeed,
+                               ByteSpan(need_bytes.data(), need_bytes.size())));
     return transfer(link, reader, writer, s);
   }
 
@@ -600,9 +633,13 @@ class SourceJob {
       uint64_t hw = 0;
       if (!proto::get_str(ap, pos, id, 64)) return err(Err::kMalformed, "SESSION_ACK");
       if (!id.empty()) {
-        if (!get_varint(ap, pos, hw)) return err(Err::kMalformed, "SESSION_ACK high water");
+        // `hw` is how many plan entries the target skipped because it already had them --
+        // reporting only. The plan that follows is already the reduced one, so this
+        // attempt starts at its beginning.
+        if (!get_varint(ap, pos, hw)) return err(Err::kMalformed, "SESSION_ACK skipped count");
         session_id = id;
-        high_water = hw;
+        high_water = 0;
+        stats.resumed_from = hw;
         resumed = true;
       }
       stats.round_trips++;
@@ -632,7 +669,6 @@ class SourceJob {
     }
     if (out_session_id != nullptr) *out_session_id = session_id;
     stats.resumed = resumed;
-    stats.resumed_from = high_water;
 
     // --- the need set (both paths end here) ---
     auto need_bytes = proto::recv_blob(reader, FrameType::kNeed, kMaxNeedBytes, &stats.frames_in);

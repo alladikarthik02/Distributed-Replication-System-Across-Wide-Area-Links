@@ -105,26 +105,48 @@ class MemoryLink : public Link {
     bool b_closed = false;
     bool reset = false;  // set by close_abruptly(): peers see kReset, not kClosed
     size_t chunk_limit = 0;
+    size_t capacity = 0;  // 0 == unbounded; see make_pair()
   };
 
   MemoryLink(std::shared_ptr<Shared> s, bool is_a) : s_(std::move(s)), a_(is_a) {}
 
-  // chunk_limit = 0 means "no artificial limit".
+  // chunk_limit = 0 means "no artificial limit" on a single operation.
+  //
+  // `capacity` bounds the in-flight queue, i.e. it models a socket's send/receive buffer.
+  // It defaults to 0 (unbounded) so that a single-threaded test can write a whole frame
+  // and read it back without a reader running -- but an unbounded transport is NOT a
+  // faithful socket, and tests that care must say so. Two things are invisible without a
+  // bound: a writer can race arbitrarily far ahead of its reader (so an abrupt close
+  // discards a backlog no real connection would have held), and a protocol that writes
+  // without reading can never be caught deadlocking on a full peer buffer -- which is a
+  // real failure this project already had to reason about (see protocol.h on the removed
+  // CHECKPOINT frame).
   static std::pair<std::shared_ptr<MemoryLink>, std::shared_ptr<MemoryLink>> make_pair(
-      size_t chunk_limit = 0) {
+      size_t chunk_limit = 0, size_t capacity = 0) {
     auto s = std::make_shared<Shared>();
     s->chunk_limit = chunk_limit;
+    s->capacity = capacity;
     return {std::make_shared<MemoryLink>(s, true), std::make_shared<MemoryLink>(s, false)};
   }
 
   Result<size_t> write_some(const uint8_t* p, size_t n) override {
     if (n == 0) return size_t{0};
-    std::lock_guard<std::mutex> g(s_->mu);
+    std::unique_lock<std::mutex> g(s_->mu);
+    auto& q = a_ ? s_->a_to_b : s_->b_to_a;
+    if (s_->capacity > 0) {
+      // Blocks like a real socket whose send buffer is full: the writer waits for the
+      // reader to drain. A partial write is then returned, which is exactly the
+      // behaviour SPEC 2.5 measured on a real socket.
+      s_->cv.wait(g, [&] {
+        return q.size() < s_->capacity || closed_locked() || peer_closed_locked();
+      });
+    }
     if (closed_locked() || peer_closed_locked()) {
       return err(s_->reset ? Err::kReset : Err::kClosed, "write to a closed link");
     }
-    const size_t k = s_->chunk_limit ? std::min(n, s_->chunk_limit) : n;
-    auto& q = a_ ? s_->a_to_b : s_->b_to_a;
+    size_t k = s_->chunk_limit ? std::min(n, s_->chunk_limit) : n;
+    if (s_->capacity > 0) k = std::min(k, s_->capacity - q.size());
+    if (k == 0) return err(Err::kIo, "no space and no error: should not happen");
     q.insert(q.end(), p, p + k);
     out_ += k;
     s_->cv.notify_all();
@@ -145,6 +167,7 @@ class MemoryLink : public Link {
     for (size_t i = 0; i < k; i++) p[i] = q[i];
     q.erase(q.begin(), q.begin() + static_cast<long>(k));
     in_ += k;
+    s_->cv.notify_all();  // a blocked writer may now have room
     return k;
   }
 

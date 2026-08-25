@@ -399,6 +399,91 @@ breaking older peers -- trading a loud five-minute bug for a silent compatibilit
 
 ---
 
+## B7 🐛⚔️ The fast resume path was slower than the fallback it was optimizing
+
+**Symptom.** The first run of the T9 resume tests:
+
+```
+note: clean run 3012726 B; dropped run 1612273 + 3001220 = 4613493 B (53.1% overhead)
+CHECK_GT(r->resumed_from, 0)   got: 0
+```
+
+A job that had already transferred half the tree resumed and re-sent **all of it**. And
+the humiliating part is one line further down: the test that *deletes the session file*
+and falls back to a full re-negotiation did better, skipping 142 of 332 chunks. The
+optimization was losing to the thing it was optimizing.
+
+**Hypotheses.**
+- (H1) The resume handshake was not happening at all and the source silently ran a fresh
+  job. — *Rejected:* `r->resumed` was true and `r->resumed_from` was 0. The fast path ran;
+  it just resumed from the beginning.
+- (H2) The checkpoint had never been written. — **True, and it was the first bug.**
+  `kCheckpointBytes` is 8 MiB and the transfer was 3 MB, so the only checkpoint on disk
+  was the initial one at zero. Any transfer smaller than one checkpoint interval resumed
+  from scratch.
+- (H3) Fixing H2 would fix the test. — **Wrong, and this is the interesting part.** I
+  changed the target to rebuild its high-water mark by probing the store instead of
+  trusting the checkpoint. The number improved (53% -> 52%) and the test still failed.
+  Something else was dominating.
+
+**How I isolated it.** H3 failing was the useful signal: if an accurate high-water mark
+barely helped, then the high-water mark was the wrong abstraction. Looking at *why* it
+stayed low: the source compresses batches on several threads, so **batches arrive out of
+order**. The mark is deliberately CONTIGUOUS (a "highest seen" mark would skip gaps and
+lose data), so a single missing early batch pins it near zero -- and the source then
+re-sends every plan position above it, **including the hundreds of chunks the target
+already had**. The mark was correct. Resuming *from* it was not.
+
+**Root cause.** A design error, not a coding error. I had built resume around "keep the
+original plan, remember how far it got, restart there", and then built machinery to
+protect that idea -- persisting the manifest and need set so plan indices stayed stable
+across a reconnect. All of that was solving a problem I had created. The plan does not
+need to be stable, because the plan does not need to be remembered.
+
+**Fix.** **Resuming is just re-negotiating without re-sending the manifest.** On
+reconnect the target re-runs the set difference against its own store, which is
+authoritative, and sends a fresh need set; both sides rebuild the plan from it. Everything
+already received drops out regardless of what order it arrived in, regardless of when the
+last checkpoint was written, and even if a chunk was lost to corruption since -- that one
+is simply re-requested. What resume still saves is the expensive half: the manifest is
+already on the target, so it is not sent again, and on a large tree that IS the cost
+(SPEC 8.3).
+
+That deleted the plan-stability requirement, the "restart at an index" logic, and the
+reason the persisted need set existed -- rather than patching any of them.
+
+**A second bug the same test exposed.** After the fix the numbers were better but the
+session-deleted case still looked bad: only 55 of 332 chunks skipped, despite two thirds
+of the transfer having gone out. That one was in the *test harness*: `MemoryLink` had an
+unbounded in-flight queue, so the source raced arbitrarily far ahead of the target and the
+injected abrupt close discarded a backlog no real socket would ever have been holding.
+Giving it a 128 KiB capacity -- modelling an actual socket buffer -- took the skip count
+from 55 to **203 of 332**.
+
+**Results, before and after:**
+
+| | before | after |
+|---|---|---|
+| drop mid-transfer, then resume | +53.1% over a clean run | **+8.7%** |
+| `run_resilient` through 3 drops | 2.06x | **1.37x** |
+| session deleted, fresh negotiation | 56% of a full transfer | **38%** |
+
+**Generalizes to.** Three things:
+
+- **When a fix produces a suspiciously small improvement, stop fixing and re-read the
+  design.** H3 was a correct fix to a real bug that moved the number by 1%. That is
+  evidence the model is wrong, not that the fix was too small.
+- **An optimization that loses to its own fallback is not slow, it is wrong.** The
+  fallback was doing the right thing all along -- asking the store what it actually has.
+  The fast path had invented a second, worse source of truth. Deleting it made the system
+  smaller AND faster, which is usually what happens when the extra state was never needed.
+- **A test transport that is more permissive than the real one hides real behaviour.** An
+  unbounded queue cannot exhibit backpressure, cannot show a writer outrunning a reader,
+  and cannot deadlock -- so it cannot catch the bugs that depend on any of those. The
+  fidelity of the fake decides what the test is capable of proving.
+
+---
+
 ## Open questions carried forward
 
 - `WanLink`'s emulated RTT sits on top of a **2.6–10.2 µs** loopback baseline with p99
