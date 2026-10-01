@@ -1,7 +1,31 @@
+# Build trees. scripts/check.sh creates one per sanitizer configuration
+# (build-none, build-address, build-thread); regenerate all three with:
+#   ./scripts/dev.sh ./scripts/check.sh
 build/
 build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Object files and static archives, if anything is ever built outside a build tree.
 *.o
 *.a
-.DS_Store
+*.d
+*.dSYM/
+
+# Spike output. The spikes in scratch/ are compiled and run by hand inside the
+# container (see docs/CHALLENGES.md B4 and B2), e.g.:
+#   ./scripts/dev.sh g++ -std=c++20 -O2 -o /tmp/spike_fs scratch/spike_fs.cpp && ./scripts/dev.sh /tmp/spike_fs
 scratch/out/
+
+# Benchmark corpora. bench_wire generates its tree under /tmp at run time, so
+# nothing should land here; the rule exists so a future --out flag cannot commit
+# a dataset by accident. Regenerate the measurements with:
+#   ./scripts/dev.sh ./build-none/bench_wire --files 300 --generations 8
 bench/data/
+
+# Editor and OS droppings.
+.DS_Store
+.vscode/
+.idea/
+*.swp
