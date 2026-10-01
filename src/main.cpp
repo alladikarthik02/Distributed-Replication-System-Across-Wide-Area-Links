@@ -33,7 +33,7 @@ int usage(int code) {
       "  wanrep target materialize --store <dir> --dataset <name> --gen <n> --out <dir>\n"
       "  wanrep target verify      --store <dir> [--deep]\n"
       "  wanrep source replicate   --tree <dir> --peer <host:port> --dataset <name>\n"
-      "                            [--gen <n>] [--rtt <ms>] [--bw <mbps>]\n\n"
+      "                            [--gen <n>] [--rtt <ms>] [--bw <Mbit/s>]\n\n"
       "Notes:\n"
       "  A store must live on a filesystem where flock actually excludes; wanrep refuses\n"
       "  to open one where it does not (see docs/CHALLENGES.md B2). Container-local\n"
